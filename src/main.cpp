@@ -4,6 +4,13 @@
 // PRG button press). Each uplink carries a LinkCheckReq, so the network replies
 // with how many gateways heard it and the link margin. Results show on the OLED;
 // full per-gateway RSSI/SNR is in TTN Console -> device -> Live data.
+//
+// Also reads NUM_SWITCHES discrete inputs. Any change triggers an uplink right
+// away (rate-limited to one per SWITCH_MIN_GAP_S). Payload (FPort 1):
+//   byte 0  switch state bitmask (bit0 = SWITCH_PINS[0], 1 = closed)
+//   byte 1  bits that toggled since the previous uplink (catches short pulses)
+//   byte 2  uplink reason: 0 = periodic, 1 = switch change, 2 = PRG button
+//   byte 3-4 uplink counter, big-endian
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -43,6 +50,65 @@ struct {
   uint32_t nextTxMs = 0;
 } st;
 
+// ---- switches ----------------------------------------------------------------
+volatile uint8_t swActivity = 0;   // set by ISR: pins that saw any edge
+uint8_t  swStable    = 0;          // debounced state
+uint8_t  swCandidate = 0;
+uint32_t swCandMs    = 0;
+uint8_t  swSent      = 0;          // state in last uplink
+uint8_t  swToggled   = 0;          // toggled bits accumulated since last uplink
+uint32_t lastEventTxMs = 0;
+
+void IRAM_ATTR swIsr(void* arg) {
+  swActivity |= (uint8_t)(uintptr_t)arg;
+}
+
+uint8_t readSwitchesRaw() {
+  uint8_t v = 0;
+  for (uint8_t i = 0; i < NUM_SWITCHES; i++) {
+    bool level = digitalRead(SWITCH_PINS[i]);
+    if (SWITCH_ACTIVE_LOW ? !level : level) v |= (1 << i);
+  }
+  return v;
+}
+
+void initSwitches() {
+  for (uint8_t i = 0; i < NUM_SWITCHES; i++) {
+    pinMode(SWITCH_PINS[i], INPUT_PULLUP);
+    attachInterruptArg(digitalPinToInterrupt(SWITCH_PINS[i]), swIsr,
+                       (void*)(uintptr_t)(1 << i), CHANGE);
+  }
+  delay(5);
+  swStable = swCandidate = swSent = readSwitchesRaw();
+  swCandMs = millis();
+}
+
+// Debounce; returns true when there is a change not yet reported.
+bool pollSwitches() {
+  noInterrupts();
+  uint8_t act = swActivity;
+  swActivity = 0;
+  interrupts();
+  swToggled |= act;
+
+  uint8_t raw = readSwitchesRaw();
+  if (raw != swCandidate) {
+    swCandidate = raw;
+    swCandMs = millis();
+  } else if (raw != swStable && millis() - swCandMs >= SWITCH_DEBOUNCE_MS) {
+    swStable = raw;
+  }
+  swToggled |= (swStable ^ swSent);
+  bool settled = (swCandidate == swStable) && (millis() - swCandMs >= SWITCH_DEBOUNCE_MS);
+  return settled && (swToggled != 0 || swStable != swSent);
+}
+
+String switchString(uint8_t v) {
+  String s = "";
+  for (uint8_t i = 0; i < NUM_SWITCHES; i++) s += (v & (1 << i)) ? "1" : "0";
+  return s;
+}
+
 // ---- nonce persistence -------------------------------------------------------
 // TTN rejects a join that reuses a DevNonce. RadioLib calls these callbacks after
 // every join attempt so the counter survives power cycles. The session itself is
@@ -62,7 +128,7 @@ void restorePersistence(uint8_t* buf, size_t len) {
 void draw() {
   display.clear();
   display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 0, "LoRaWAN survey  DR" + String(SURVEY_DATARATE));
+  display.drawString(0, 0, "DR" + String(SURVEY_DATARATE) + "   SW " + switchString(swStable));
   display.drawString(0, 11, st.status);
 
   if (node.isActivated()) {
@@ -111,11 +177,20 @@ bool join() {
   return false;
 }
 
-void sendUplink() {
+enum : uint8_t { REASON_PERIODIC = 0, REASON_SWITCH = 1, REASON_BUTTON = 2 };
+
+void sendUplink(uint8_t reason) {
   node.sendMacCommandReq(RADIOLIB_LORAWAN_MAC_LINK_CHECK);
 
-  uint8_t payload[2] = { (uint8_t)(st.uplinks >> 8), (uint8_t)st.uplinks };
-  st.status = "Sending #" + String(st.uplinks + 1);
+  // snapshot switch state; anything that changes during the send is caught next time
+  pollSwitches();
+  uint8_t state = swStable, toggled = swToggled;
+  swSent = state;
+  swToggled = 0;
+
+  uint16_t n = (uint16_t)(st.uplinks + 1);
+  uint8_t payload[5] = { state, toggled, reason, (uint8_t)(n >> 8), (uint8_t)n };
+  st.status = "Sending #" + String(st.uplinks + 1) + (reason == REASON_SWITCH ? " (SW)" : "");
   draw();
   blink();
 
@@ -141,6 +216,8 @@ void sendUplink() {
   } else {
     st.status = "Send error " + String(rc);
   }
+  Serial.printf("[up] sw=%s toggled=%s reason=%u\n", switchString(state).c_str(),
+                switchString(toggled).c_str(), reason);
   Serial.printf("[up] #%lu rc=%d gw=%d margin=%d dlRssi=%.0f dlSnr=%.1f\n",
                 (unsigned long)st.uplinks, rc, st.gwCount, st.margin, st.dlRssi, st.dlSnr);
 }
@@ -150,6 +227,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
+  initSwitches();
 
   // OLED power + reset
   pinMode(PIN_VEXT, OUTPUT);
@@ -184,7 +262,9 @@ void setup() {
     uint32_t until = millis() + JOIN_RETRY_S * 1000UL;
     while ((int32_t)(until - millis()) > 0) {
       if (digitalRead(PIN_BUTTON) == LOW) break;  // PRG = retry now
-      delay(50);
+      pollSwitches();
+      if (millis() % 500 < 20) draw();
+      delay(20);
     }
   }
   st.nextTxMs = millis();  // first uplink immediately
@@ -193,9 +273,14 @@ void setup() {
 void loop() {
   static uint32_t lastDraw = 0;
   bool button = digitalRead(PIN_BUTTON) == LOW;
+  bool swChanged = pollSwitches();
+  bool swReady = swChanged && (lastEventTxMs == 0 ||
+                 millis() - lastEventTxMs >= SWITCH_MIN_GAP_S * 1000UL);
 
-  if (button || (int32_t)(millis() - st.nextTxMs) >= 0) {
-    sendUplink();
+  if (button || swReady || (int32_t)(millis() - st.nextTxMs) >= 0) {
+    uint8_t reason = button ? REASON_BUTTON : (swReady ? REASON_SWITCH : REASON_PERIODIC);
+    if (reason == REASON_SWITCH) lastEventTxMs = millis();
+    sendUplink(reason);
     st.nextTxMs = millis() + UPLINK_INTERVAL_S * 1000UL;
     while (digitalRead(PIN_BUTTON) == LOW) delay(10);  // wait for release
   }
