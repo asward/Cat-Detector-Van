@@ -58,15 +58,33 @@ Power it from a 1S LiPo on the JST connector.
 
 ## Base
 
+The display is in portrait (rotated 90°). To rotate the other way, change `BASE_ROTATION` in `src/base/main.cpp` from `U8G2_R1` to `U8G2_R3`.
+
 ```
-Node 1  12s ago  switch       <- or blinking "NODE LOST  4m ago"
- [1]  [■2■]  [3]  [■4■]       <- filled = closed, tick under = changed in last msg
--87dBm  SNR 9.5dB
-msgs 42  lost 0  dup 1
+NODE 1
+12s ago sw          <- or blinking "LOST 4m"
+[ 1 ] [■2■]         <- filled = closed
+[■3■] [ 4 ]            bar under = changed in last msg
+-87dBm 9.5dB
+──────────
+N BAT? 87%          <- node power
+   4.05V  [▮▮▮ ]
+──────────
+B USB? 100%         <- base power
+   4.19V  [▮▮▮▮]
 ```
 
 - `lost`: gaps in sequence numbers, meaning messages that never arrived.
 - `dup`: retransmissions, where the base's ACK didn't reach the node and it sent again. The base ACKs these again but doesn't count them as new messages.
+
+## Power / battery
+
+Both boards measure their own battery voltage, and the node includes its reading in every message. The node's status screen shows its own battery; the base shows both.
+
+- **Battery voltage:** read through the board's 220k/100k divider. V2.1 boards use GPIO37 and V2.0 boards use GPIO13; the firmware detects which at boot, and the serial log shows `batt sense GPIOxx` (`GPIO-1` means none was found). Percentage comes from a typical LiPo discharge curve, so treat it as approximate.
+- **USB vs battery:** the V2 has no signal that says whether USB is plugged in, so by default this is a **guess**, shown with a `?`. It reads `USB?` when the cell is at or above 4.15 V or rising (charging), otherwise `BAT?`. A full battery that was just unplugged will show `USB?` until it drops below 4.15 V.
+  - **For reliable detection:** connect the board's **5V** pin to two 100k resistors in series down to GND, wire the midpoint to a free input (GPIO 36, 38 or 39), and set `#define PIN_VBUS_SENSE 36` (or whichever pin) at the top of `include/power.h`. The `?` then disappears.
+- **No real BMS data:** the V2's charger chip has no data interface, so voltage, percentage and source are all the firmware can know. A cell with a fuel-gauge chip (e.g. MAX17048) would give accurate percentage and charge rate; that's an easy add-on if you want it.
 
 ## Radio settings (`include/link.h`)
 
@@ -83,9 +101,11 @@ Both boards must have identical radio settings. Heartbeat, retry counts and the 
 
 | Packet | Bytes |
 |---|---|
-| State (node → base, 14 B) | magic `0xCD`, type `0x01`, nodeId, boot u16, seq u16, state, toggled, reason, MAC[4] |
+| State (node → base, 17 B) | magic `0xCD`, type `0x01`, nodeId, boot u16, seq u16, state, toggled, reason, vbat_mV u16, power, MAC[4] |
 | ACK (base → node, 13 B) | magic, type `0x02`, nodeId, boot u16, seq u16, rssi i8, snr×4 i8, MAC[4] |
 
-Reason codes: 0 = boot, 1 = switch, 2 = heartbeat, 3 = button, 4 = retry.
+Reason codes: 0 = boot, 1 = switch, 2 = heartbeat, 3 = button, 4 = retry. The `power` byte holds: bits 0–1 = source (1 battery, 2 USB), bit 2 = guessed, bit 3 = voltage valid.
+
+**Flash both boards after this change:** the packet grew, so an old node and a new base (or the reverse) will reject each other's packets.
 
 The earlier TTN/LoRaWAN coverage-surveyor version is in this repo's git history.

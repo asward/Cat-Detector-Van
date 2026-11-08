@@ -59,6 +59,8 @@ struct __attribute__((packed)) StatePkt {
   uint8_t  state;     // bit i = SWITCH_PINS[i] closed
   uint8_t  toggled;   // bits changed since last ACKed message
   uint8_t  reason;
+  uint16_t vbatMv;    // node battery voltage, mV (0 = no reading)
+  uint8_t  power;     // packPower(): source / guessed / valid bits
   uint8_t  mac[MAC_LEN];
 };
 
