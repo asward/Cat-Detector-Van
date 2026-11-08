@@ -14,6 +14,7 @@
 #include <esp_sleep.h>
 #include <driver/gpio.h>
 #include "link.h"
+#include "power.h"
 
 #define SCREEN_ON_S   10
 #define USE_LIGHT_SLEEP 1   // set 0 while debugging over USB serial
@@ -21,6 +22,8 @@
 SX1276 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO0, PIN_LORA_RST, PIN_LORA_DIO1);
 SSD1306Wire display(0x3c, PIN_OLED_SDA, PIN_OLED_SCL, GEOMETRY_128_64);
 Preferences prefs;
+PowerMon power;
+PowerInfo pwr;
 
 volatile bool radioIrq = false;
 void IRAM_ATTR onRadioIrq() { radioIrq = true; }
@@ -91,11 +94,15 @@ void draw() {
   if (!screenPowered) return;
   display.clear();
   display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 0, "NODE " + String(NODE_ID) + "   SW " + switchString(swStable));
+  display.drawString(0, 0, "N" + String(NODE_ID) + " SW " + switchString(swStable));
+  display.setTextAlignment(TEXT_ALIGN_RIGHT);
+  display.drawString(128, 0, powerShort(pwr));
+  if (pwr.valid) display.drawString(128, 12, String(pwr.mv / 1000.0f, 2) + "V");
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
   if (!stats.everAcked) {
     display.drawString(0, 12, "Base not heard yet");
   } else {
-    display.drawString(0, 12, stats.lastOk ? "Link OK" : "Last msg NOT acked");
+    display.drawString(0, 12, stats.lastOk ? "Link OK" : "NOT acked");
     display.drawString(0, 23, "At base: " + String(stats.baseRssi) + "dBm " + String(stats.baseSnr, 1) + "dB");
     display.drawString(0, 34, "ACK in: " + String(stats.ackRssi, 0) + "dBm " + String(stats.ackSnr, 1) + "dB");
   }
@@ -142,6 +149,9 @@ bool sendState(uint8_t reason) {
   p.state = swStable;
   p.toggled = swToggled | (swStable ^ swAcked);
   p.reason = reason;
+  pwr = power.read(screenPowered);   // measure before TX (TX sags the cell)
+  p.vbatMv = pwr.valid ? pwr.mv : 0;
+  p.power = packPower(pwr);
   signPkt(p);
 
   stats.sent++;
@@ -156,9 +166,9 @@ bool sendState(uint8_t reason) {
   }
   radio.sleep();
 
-  Serial.printf("[tx] seq=%u sw=%s toggled=%s reason=%u -> %s (tries %u)\n", p.seq,
+  Serial.printf("[tx] seq=%u sw=%s toggled=%s reason=%u %s %umV -> %s (tries %u)\n", p.seq,
                 switchString(p.state).c_str(), switchString(p.toggled).c_str(), reason,
-                ok ? "ACK" : "no ack", stats.lastTries);
+                powerShort(pwr).c_str(), pwr.mv, ok ? "ACK" : "no ack", stats.lastTries);
 
   stats.lastOk = ok;
   if (ok) {
@@ -220,6 +230,9 @@ void setup() {
 
   screenPower(true);
   screenOffAtMs = millis() + SCREEN_ON_S * 1000UL;
+  power.begin();
+  pwr = power.read(true);
+  Serial.printf("[node] batt sense GPIO%d, %s %umV\n", power.pin(), powerShort(pwr).c_str(), pwr.mv);
 
   int16_t rc = linkRadioBegin(radio);
   if (rc != RADIOLIB_ERR_NONE) {
@@ -266,6 +279,8 @@ void loop() {
   if (screenPowered && (int32_t)(millis() - screenOffAtMs) >= 0) screenPower(false);
 
   if (screenPowered) {
+    static uint32_t lastPwrMs = 0;
+    if (millis() - lastPwrMs > 2000) { pwr = power.read(true); lastPwrMs = millis(); }
     draw();
     // stay awake while the screen is on, but still react to switches quickly
     uint32_t until = millis() + 250;
