@@ -47,7 +47,7 @@ struct {
   float    ackSnr = 0;
   uint32_t sent = 0, acked = 0, failed = 0;
   uint8_t  lastTries = 0;
-} link;
+} stats;
 
 // ---- switches ----------------------------------------------------------------
 uint8_t readSwitchesRaw() {
@@ -92,16 +92,16 @@ void draw() {
   display.clear();
   display.setFont(ArialMT_Plain_10);
   display.drawString(0, 0, "NODE " + String(NODE_ID) + "   SW " + switchString(swStable));
-  if (!link.everAcked) {
+  if (!stats.everAcked) {
     display.drawString(0, 12, "Base not heard yet");
   } else {
-    display.drawString(0, 12, link.lastOk ? "Link OK" : "Last msg NOT acked");
-    display.drawString(0, 23, "At base: " + String(link.baseRssi) + "dBm " + String(link.baseSnr, 1) + "dB");
-    display.drawString(0, 34, "ACK in: " + String(link.ackRssi, 0) + "dBm " + String(link.ackSnr, 1) + "dB");
+    display.drawString(0, 12, stats.lastOk ? "Link OK" : "Last msg NOT acked");
+    display.drawString(0, 23, "At base: " + String(stats.baseRssi) + "dBm " + String(stats.baseSnr, 1) + "dB");
+    display.drawString(0, 34, "ACK in: " + String(stats.ackRssi, 0) + "dBm " + String(stats.ackSnr, 1) + "dB");
   }
-  display.drawString(0, 45, "Sent " + String(link.sent) + " ok " + String(link.acked) + " fail " + String(link.failed));
+  display.drawString(0, 45, "Sent " + String(stats.sent) + " ok " + String(stats.acked) + " fail " + String(stats.failed));
   int32_t hb = ((int32_t)(nextHeartbeatMs - millis())) / 1000;
-  display.drawString(0, 54, "HB in " + String(hb < 0 ? 0 : hb) + "s  tries " + String(link.lastTries));
+  display.drawString(0, 54, "HB in " + String(hb < 0 ? 0 : hb) + "s  tries " + String(stats.lastTries));
   display.display();
 }
 
@@ -120,10 +120,10 @@ bool waitForAck(uint16_t mySeq) {
     if (rc == RADIOLIB_ERR_NONE && len == sizeof(a) && a.magic == PKT_MAGIC &&
         a.type == PKT_ACK && a.nodeId == NODE_ID && a.boot == bootCount &&
         a.seq == mySeq && verifyPkt(a)) {
-      link.baseRssi = a.rssi;
-      link.baseSnr  = a.snr4 / 4.0f;
-      link.ackRssi  = radio.getRSSI();
-      link.ackSnr   = radio.getSNR();
+      stats.baseRssi = a.rssi;
+      stats.baseSnr  = a.snr4 / 4.0f;
+      stats.ackRssi  = radio.getRSSI();
+      stats.ackSnr   = radio.getSNR();
       return true;
     }
     radio.startReceive();  // not ours / corrupt: keep listening
@@ -144,10 +144,10 @@ bool sendState(uint8_t reason) {
   p.reason = reason;
   signPkt(p);
 
-  link.sent++;
+  stats.sent++;
   bool ok = false;
   for (uint8_t attempt = 1; attempt <= TX_ATTEMPTS && !ok; attempt++) {
-    link.lastTries = attempt;
+    stats.lastTries = attempt;
     digitalWrite(PIN_LED, HIGH);
     int16_t rc = radio.transmit((uint8_t*)&p, sizeof(p));
     digitalWrite(PIN_LED, LOW);
@@ -158,17 +158,17 @@ bool sendState(uint8_t reason) {
 
   Serial.printf("[tx] seq=%u sw=%s toggled=%s reason=%u -> %s (tries %u)\n", p.seq,
                 switchString(p.state).c_str(), switchString(p.toggled).c_str(), reason,
-                ok ? "ACK" : "no ack", link.lastTries);
+                ok ? "ACK" : "no ack", stats.lastTries);
 
-  link.lastOk = ok;
+  stats.lastOk = ok;
   if (ok) {
-    link.everAcked = true;
-    link.acked++;
+    stats.everAcked = true;
+    stats.acked++;
     swAcked = p.state;
     swToggled = 0;
     retryAtMs = 0;
   } else {
-    link.failed++;
+    stats.failed++;
     swToggled = p.toggled;  // keep for next attempt
     retryAtMs = millis() + RETRY_FAIL_S * 1000UL;
   }
