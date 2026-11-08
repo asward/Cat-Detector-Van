@@ -1,40 +1,41 @@
-# LoRaWAN coverage surveyor (Heltec WiFi LoRa 32 V2)
+# Cat Detector Van
 
-Battery-powered TTN end node for checking gateway coverage at a site. It joins TTN with OTAA, then sends a tiny uplink every 30 s (or when you press **PRG**). Each uplink includes a LinkCheck request, so the OLED shows how many gateways heard it and the link margin. For the full per-gateway RSSI/SNR, open TTN Console → your device → **Live data** on your phone.
+Two Heltec WiFi LoRa 32 V2 boards talking directly over LoRa (no LoRaWAN, no TTN, no Wi-Fi):
 
-Built with the generic Arduino-ESP32 core, [RadioLib](https://github.com/jgromes/RadioLib) 8.0.0 and the ThingPulse SSD1306 driver. No Heltec libraries are used.
+- **Node** (battery): reads 4 switches and sends their state to the base as soon as any of them changes, plus a heartbeat every 60 s. The screen is off and the board sleeps between events.
+- **Base** (USB): shows the 4 switches, signal strength and link health. It raises a **NODE LOST** alarm if the node goes quiet.
 
-## One-time setup
+Built with PlatformIO, the generic Arduino-ESP32 core, [RadioLib](https://github.com/jgromes/RadioLib) 8.0.0 and the ThingPulse SSD1306 driver.
 
-1. **TTN Console:** in your application, choose *Register end device* → *Enter manually*.
-   - Frequency plan: **United States 902-928 MHz, FSB 2 (used by TTN)**
-   - LoRaWAN version: **1.0.4**, Regional Parameters: **RP002 1.0.3**
-   - JoinEUI: all zeros is fine. Generate a DevEUI and an AppKey.
-2. Copy `include/secrets.example.h` to `include/secrets.h` and paste in the JoinEUI, DevEUI and AppKey (msb order, as TTN shows them).
-3. Install [PlatformIO](https://platformio.org/install/cli) (CLI or the VS Code extension), plug in the board, and run:
+## Setup
+
+1. Install [PlatformIO](https://platformio.org/install/cli), either the CLI or the VS Code extension.
+2. Create the shared key. Copy `include/secrets.example.h` to `include/secrets.h` and generate a key:
    ```
-   pio run -t upload
-   pio device monitor      # optional: serial log at 115200
+   openssl rand -hex 16
+   ```
+   Write the 32 hex characters as 16 `0x..` bytes in `NET_KEY`. **Both boards must use the same key**, so flash them from the same checkout.
+3. Flash each board:
+   ```
+   pio run -e base -t upload     # board 1
+   pio run -e node -t upload     # board 2
+   pio device monitor            # optional serial log, 115200
    ```
 
-After this you won't need the laptop. Plug a 1S LiPo into the JST connector; the board charges it over USB.
+## Pairing / security
 
-## In the field
+Every packet carries a 4-byte HMAC-SHA256 tag made with `NET_KEY`:
+- The base ignores packets from anything not signed with your key; they're counted as "Rejected".
+- The node ignores any ACK that isn't from your base.
+- The base drops replayed or old sequence numbers.
 
-| OLED shows | Meaning |
-|---|---|
-| `Joining... try N` | No gateway in range yet, or keys/region wrong. Retries every 20 s; press PRG to retry now. |
-| `JOINED <devaddr>` | A gateway heard you and TTN answered. You have coverage. |
-| `GW 2  M 12dB` | 2 gateways heard the last uplink; 12 dB margin above the demod floor (more is better, around 0 is the edge). |
-| `No reply to last uplink` | Uplink sent, no downlink came back. The uplink may still have been heard, so check Live data. |
-| `DL -105dBm 6.0dB` | Strength of the gateway's reply at the node. |
-| `23s` (bottom right) | Time to the next automatic uplink. PRG sends one now. |
+Payloads are signed but not encrypted, so anyone listening can read the switch states but can't fake them.
 
-The top line shows the 4 switch states, e.g. `SW 1010`.
+## Node
 
-## Switch inputs
+### Wiring
 
-Four switch inputs. Wire each switch between its pin and **GND**; the internal pull-ups are used, so no resistors are needed.
+Wire each switch between its pin and **GND**; the internal pull-ups are used, so no resistors are needed. Closed = `1`.
 
 | Switch | GPIO |
 |---|---|
@@ -43,31 +44,48 @@ Four switch inputs. Wire each switch between its pin and **GND**; the internal p
 | SW3 | 23 |
 | SW4 | 2 |
 
-- Closed = `1`, open = `0`. Inputs are debounced (50 ms).
-- **Any change sends an uplink right away.** Change-triggered uplinks are spaced at least 5 s apart; if a switch changes again within that window, the latest state goes out when the window ends. Inputs are also read by interrupt, so a pulse shorter than the debounce time still shows up in the `toggled` bits.
-- The periodic 30 s uplink also carries the current switch states.
-- An uplink takes a few seconds (TX plus the two receive windows). A change during that time goes out in the next uplink.
+Power it from a 1S LiPo on the JST connector.
 
-## Payload (FPort 1, 5 bytes)
+### Behaviour
 
-| Byte | Content |
+- **On a switch change** (debounced 50 ms), it sends straight away. It waits for the base's ACK and retries up to 4 times with backoff. If all tries fail, it tries again 15 s later and keeps going until the base ACKs.
+- **Heartbeat:** every 60 s it sends its state so the base knows it's alive.
+- **Power:** the OLED rail is switched off and the radio sleeps. The ESP32 light-sleeps until a switch changes, PRG is pressed, or the heartbeat is due.
+- **PRG button:** shows the status screen for 10 s and sends immediately. The screen shows the link status, how strongly the base heard the node, how strongly the node heard the ACK, and sent/ok/fail counts.
+- **LED** flashes on each transmission.
+- **Limitation:** a switch pulse shorter than about 50 ms while the node is asleep can be missed. Any change that lasts longer is reported.
+- **Debugging:** set `USE_LIGHT_SLEEP 0` in `src/node/main.cpp` while you're watching the serial log, because the USB serial port drops out during light sleep.
+
+## Base
+
+```
+Node 1  12s ago  switch       <- or blinking "NODE LOST  4m ago"
+ [1]  [■2■]  [3]  [■4■]       <- filled = closed, tick under = changed in last msg
+-87dBm  SNR 9.5dB
+msgs 42  lost 0  dup 1
+```
+
+- `lost`: gaps in sequence numbers, meaning messages that never arrived.
+- `dup`: retransmissions, where the base's ACK didn't reach the node and it sent again. The base ACKs these again but doesn't count them as new messages.
+
+## Radio settings (`include/link.h`)
+
+| Setting | Default | Notes |
+|---|---|---|
+| Frequency | 915.0 MHz | Fixed channel |
+| Bandwidth | 500 kHz | Qualifies as FCC 15.247 digital modulation, so no frequency hopping is needed in the US |
+| SF | 10 | About 80 ms per packet. Raise it (max 12) for more range |
+| Power | 17 dBm | |
+
+Both boards must have identical radio settings. Heartbeat, retry counts and the node-lost timeout are also set in `link.h`.
+
+## Packets
+
+| Packet | Bytes |
 |---|---|
-| 0 | Switch states bitmask (bit 0 = SW1, 1 = closed) |
-| 1 | Bits that toggled since the previous uplink |
-| 2 | Reason: 0 = periodic, 1 = switch change, 2 = PRG button |
-| 3–4 | Uplink counter, big-endian |
+| State (node → base, 14 B) | magic `0xCD`, type `0x01`, nodeId, boot u16, seq u16, state, toggled, reason, MAC[4] |
+| ACK (base → node, 13 B) | magic, type `0x02`, nodeId, boot u16, seq u16, rssi i8, snr×4 i8, MAC[4] |
 
-To see named fields in Live data, paste [`ttn-decoder.js`](ttn-decoder.js) into TTN Console → your application → **Payload formatters → Uplink → Custom JavaScript formatter**. Fields then show as `sw1: "closed"`, `reason: "switch"`, and so on.
+Reason codes: 0 = boot, 1 = switch, 2 = heartbeat, 3 = button, 4 = retry.
 
-## Settings (`include/config.h`)
-
-- `SURVEY_DATARATE`: fixed data rate, ADR off. Default `0` (SF10, longest range in US915). Use `3` (SF7) to test the short-range case.
-- `UPLINK_INTERVAL_S`: default 30 s.
-- `SWITCH_PINS`, `SWITCH_ACTIVE_LOW`, `SWITCH_MIN_GAP_S`: switch pins, polarity, and spacing between change-triggered uplinks.
-- Region/sub-band: `US915` / `2`. For Europe use `EU868` / `0` and pick the matching TTN frequency plan.
-
-## Notes
-
-- **DevNonce persistence:** TTN rejects joins that reuse an old DevNonce. The node stores its nonce counter in flash (NVS) after every join attempt, so power-cycling is safe. If you delete and re-create the device in TTN, it will still accept the higher nonces. If you change the keys, the stored state is discarded automatically.
-- **Fair use:** SF10 every 30 s uses about 45 s of airtime per hour. TTN's fair-use guideline is 30 s per day, so for a survey session of an hour or two that's acceptable, but don't leave it running.
-- The session isn't saved: the node rejoins each time it powers up, which is itself a useful coverage check.
+The earlier TTN/LoRaWAN coverage-surveyor version is in this repo's git history.
